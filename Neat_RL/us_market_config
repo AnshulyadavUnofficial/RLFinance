@@ -1,0 +1,104 @@
+[NEAT]
+# population level parameters, maximize fitness/ if fitness_criterion, ie max fitness of an individual is over threshold training stops
+# have a decently large populaion size and dont reset on extinction, throw an error
+fitness_criterion = max
+fitness_threshold = 0.999
+pop_size = 2000
+reset_on_extinction = False
+
+[DefaultGenome]
+####  Weight parameters
+# Aggregation and Activation: inputs and weights are yi = aggregate(wi*xi), then zi = activate(yi+bi) 
+# aggregate using sum and dont mutate, the only option is sum
+aggregation_default = sum
+aggregation_mutate_rate = 0.0
+aggregation_options = sum
+
+# activate using sigmoid, dont mutate, and the only option is sigmoid
+activation_default = sigmoid
+activation_mutate_rate = 0.0
+activation_options = sigmoid
+
+# Connection (Weight Mutations):
+# small prob to add weight, very small to delete weights
+# All new weights are enabled by default, with a very small prob to disable them
+conn_add_prob = 0.02
+conn_delete_prob = 0.01
+enabled_default = True
+enabled_mutate_rate = 0.01
+
+# Weight Params
+# Initialixation: standar normal
+weight_init_mean = 0.0
+weight_init_stdev = 1.0
+weight_init_type = gaussian
+# Updates:
+weight_max_value = 30
+weight_min_value = -30
+weight_mutate_power = 0.02
+weight_mutate_rate = 0.02
+weight_replace_rate = 0.0
+
+
+#### Bias parameters
+# Initialization: standard normal 
+bias_init_mean = 0.0
+bias_init_stdev = 1.0
+bias_init_type = gaussian
+
+# General Use: high bounds on boh sides, rate controls the prob of whether a change will occur, and power the strength of pertubation.
+# disallow complete replacements, only same perturbations some time 
+bias_max_value = 30.0
+bias_min_value = -30.0
+bias_mutate_rate = 0.02
+bias_mutate_power = 0.02
+bias_replace_rate = 0.0
+
+# Node Addition and deletion: a small prob to add a node, a much smaller prob to delete one
+node_add_prob = 0.02
+node_delete_prob = 0.01
+
+#### Response Paramaeters: Applied after aggregation to the yi, before adding in the bias and activating
+# Dont use this. make all values 1, with no power, std
+response_init_mean = 1.0
+response_init_stdev = 0.0
+response_max_value = 1.0
+response_min_value = 1.0
+response_mutate_power = 0.0
+response_mutate_rate = 0.0
+response_replace_rate = 0.0
+
+#### Compatibity Coefficients
+compatibility_disjoint_coefficient = 1.0
+compatibility_weight_coefficient = 0.5
+
+#### Network Params
+# A standard feed forward net, no recurrence
+# all input nodes are connected to all output nodes initially
+feed_forward = True
+initial_connection = full_direct
+# number of input, output and hidden layers
+num_hidden = 5
+num_inputs = 36
+num_outputs = 4
+
+[DefaultSpeciesSet]
+# the distance in the innovation space below which 2 genes are considered part of the same species.
+compatibility_threshold = 1.6
+
+[DefaultStagnation]
+#### Stagnation Params
+# use the mean of the species to determine stagnation, allow the species to stagnate
+# for decent time and protect atleast a few from elimination
+species_fitness_func = mean
+max_stagnation = 50
+species_elitism = 3
+
+[DefaultReproduction]
+#### Reproduction Params
+# elitism: most fit individual in each species carried over as is
+# have atleast num elitism species survice each generation and allow
+# only a few to reproduce each time
+elitism = 5
+survival_threshold = 0.4
+min_species_size = 5

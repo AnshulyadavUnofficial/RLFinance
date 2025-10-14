@@ -1,0 +1,993 @@
+from enum import Enum
+import gymnasium as gym
+import numpy as np
+from USstockHelper import DataSlice
+from typing import  Optional,  Dict, List
+import pandas as pd
+from pathlib import Path
+import random
+import scipy.stats as scipy_stats
+
+
+FLOAT_TYPE = np.float32     # float16 should be enough as a compromise between speed and accuracy.
+INT_TYPE = np.int32         # atleast 16 bits, 2^8 = 256 but there are 390 mins in each trading day.
+
+
+def cache_directory_files(directory: str, exclude_sub_dir: Optional[str] = None, num_prev_file=0):
+    """
+    Collects and caches all CSV files in each immediate subdirectory of `directory`,
+    converting them to normalized arrays.
+    
+    Args:
+        directory: Path of the top-level directory whose subdirectories contain CSVs
+        exclude_sub_dir: Name of a subdirectory to fully exclude (optional)
+    
+    Returns:
+        Dictionary mapping relative file paths (from `directory`) to DataSlice objects.
+    
+    Raises:
+        FileNotFoundError: If no valid files are found
+    """
+    root = Path(directory)
+    cache = {}
+    new_cache = {}
+    directory_group: list[Path] = []
+    
+    if exclude_sub_dir is not None:
+        exclude_sub_dir = exclude_sub_dir.split("/")[-1]
+    
+    # either the root is s directory of directories, each of which contains files
+    # or a directory that contains files.
+    for sub_dir in root.iterdir():
+        # root is a directory of files
+        if sub_dir.is_file():
+            directory_group.append(root)
+            break
+        # root is a directory of directories
+        if exclude_sub_dir != sub_dir.name:
+            directory_group.append(sub_dir)
+    
+    # process the groups, each directory in group, is presumed to have only files and a date_file.txt
+    for directory in directory_group:
+        # Iterate files in this subdirectory
+        for path in directory.iterdir():
+            if not path.is_file():
+                continue
+            if "date_file.txt" == path.name:
+                continue
+
+            # Read CSV: assume 'Time' index column exists
+            df = pd.read_csv(path, header=0, index_col="Time")
+
+            # Convert time index to minutes since 09:30
+            # e.g., if index is "09:45", "09:45:00" minus 09:30
+            time_deltas = pd.to_timedelta(df.index + ":00") - pd.Timedelta(hours=9, minutes=30)
+            # do the conversion in float64 (safe), then get numpy array
+            times = (time_deltas.total_seconds() / 60).to_numpy().astype(np.float64)
+
+            # Extract OHLCV columns as float64 arrays (transpose to keep same layout)
+            bars = df[["Open", "High", "Low", "Close", "Volume"]].to_numpy(dtype=np.float64).T
+            
+            # Store with relative path from root, e.g. "subdir/filename.csv"
+            # NOTE: cache stores float64 arrays (safe intermediate representation)
+            cache[str(path)] = DataSlice(
+                time=times,
+                open=bars[0],
+                high=bars[1],
+                low=bars[2],
+                close=bars[3],
+                volume=bars[4]
+            )
+            
+        if num_prev_file == 0:
+            continue
+
+        # a valid directory, read the date file in order.
+        file_order = []
+        done_files = set()
+        
+        with open(directory.joinpath("date_file.txt"), "r") as file:
+            for (ind, line) in enumerate(file):
+                file_path = directory.joinpath(line.strip())
+                file_order.append(str(file_path))
+        
+        # write the historical average for volume
+        for (ind, file) in enumerate(file_order):
+            if ind < num_prev_file:
+                continue
+            if file in done_files:
+                continue  # dont repeat the file
+            
+            # Use float64 for accumulation to avoid overflow
+            rel_volume = np.zeros_like(cache[file].volume, dtype=np.float64)
+            
+            for i in range(ind - 1, ind - (num_prev_file + 1), -1):  # because stop in range is exclusive
+                file_name = file_order[i]
+                # accumulate in float64
+                rel_volume += cache[file_name].volume.astype(np.float64)
+            rel_volume = rel_volume / np.float64(num_prev_file)
+            
+            curr_slice = cache[file]
+            
+            # Convert all ohlc data to representative space, and volume to relative_volume
+            market_open = curr_slice.open[0].astype(np.float64)
+            
+            # Do internal computations in float64 then cast to FLOAT_TYPE only for new_cache
+            open_norm  = (curr_slice.open.astype(np.float64)  / market_open).astype(FLOAT_TYPE)
+            close_norm = (curr_slice.close.astype(np.float64) / market_open).astype(FLOAT_TYPE)
+            low_norm   = (curr_slice.low.astype(np.float64)   / market_open).astype(FLOAT_TYPE)
+            high_norm  = (curr_slice.high.astype(np.float64)  / market_open).astype(FLOAT_TYPE)
+            # volume division done in float64 then cast
+            volume_rel = (curr_slice.volume.astype(np.float64) / rel_volume).astype(FLOAT_TYPE)
+            time_cast  = curr_slice.time.astype(FLOAT_TYPE)
+
+            new_cache[file] = DataSlice(
+                time=time_cast,
+                open=open_norm,
+                close=close_norm,
+                low=low_norm,
+                high=high_norm,
+                volume=volume_rel
+            )
+            
+            done_files.add(file)
+    return cache if num_prev_file == 0 else new_cache
+
+class StockState(float, Enum):
+    short = FLOAT_TYPE(-1)
+    noTrade = FLOAT_TYPE(0)
+    long = FLOAT_TYPE(1)
+
+class USStockEnv(gym.Env):
+    
+    def __init__(self, data_cache: Dict[str, DataSlice], reward_scale_factor: float = 1, look_back_period=10):
+        """
+        Initialize the trading environment.
+
+        Args:
+            data_cache (Dict[str, DataSlice]):
+                Mapping from file path (relative to dataset root) to a DataSlice object containing
+                OHLCV data and time deltas (in minutes) for each bar/candle.
+
+            reward_scale_factor (float, default=1):
+                Scalar applied to the natural log-return reward. Chosen such that the mean absolute
+                reward magnitude across the dataset is approximately 1 for stable training.
+
+            look_back_period (int, default=10):
+                Number of past time steps to include in the sliding observation window when 
+                constructing each environment state.
+        """
+
+        # Agent action spec from 0->2 and internal map for conversion
+        self.action_space = gym.spaces.Int16Discrete(n=3, start=0)
+        self._action_map = {INT_TYPE(0): StockState.short, INT_TYPE(1): StockState.noTrade, INT_TYPE(2): StockState.long}
+
+        # Agent simple features (independent and dependent) and compound features
+        self._L = INT_TYPE(look_back_period)
+        self._I = INT_TYPE(6)        # agent independent features
+        self._D = INT_TYPE(4)        # agent dependent features
+        self._C = INT_TYPE(6)        # compound features
+
+        self.observation_space = gym.spaces.Dict(
+            spaces={
+                'independent': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._L, self._I),
+                    dtype=FLOAT_TYPE
+                ),
+                'dependent': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._L, self._D),
+                    dtype=FLOAT_TYPE
+                ),
+                'compound': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._C,),
+                    dtype=FLOAT_TYPE
+                ),
+            }
+        )
+
+        # Some Variables
+        self._market_end_time_delta = FLOAT_TYPE(389.0)
+        self._data_cache = data_cache
+        self._files = list(self._data_cache.keys())
+        self._FILE_NAME = None  # current file for logging purposes
+        self._Holding_Threshold = INT_TYPE(self._L)
+
+        """ Scale Factors """
+        self._reward_sf = FLOAT_TYPE(reward_scale_factor)
+
+        # Compound states scale factor
+        self._skew_sf = FLOAT_TYPE(1 / 1.5)  # 1/resolution
+        self._kurtotsis_sf = FLOAT_TYPE(1 / 5)
+        self._max_dd_sf = self._reward_sf / FLOAT_TYPE(4)  # eyeball estimate
+        self._volatility_sf = self._reward_sf
+
+        # Dependent states scale factor
+        self._cumul_pnl_sf = self._reward_sf / FLOAT_TYPE(10)
+        self._mr_action_time_delta_sf = FLOAT_TYPE(1) / self._market_end_time_delta
+
+        # Independent states scale factors
+        self._true_range_sf = FLOAT_TYPE(500)
+        self._intra_bar_vol_porxy_sf = self._reward_sf
+        self._dlogprice_sf = self._reward_sf
+        self._ohlc_sf = self._reward_sf / FLOAT_TYPE(10)
+
+        # Hindsight bonus weighting factor
+        self._hindsight_wf = FLOAT_TYPE(1)
+
+        """ Fees """
+        self._one_side_fee = FLOAT_TYPE(0.0003)
+        self._log_one_side_fee = FLOAT_TYPE(np.log(1 - self._one_side_fee))
+
+        """ Predefined Rewards """
+        self._inactive_wf = FLOAT_TYPE(0.0)
+        self._inactive_k = FLOAT_TYPE(2)
+        self._max_inactive_time = FLOAT_TYPE(25)
+
+        """ Logging purposes """
+        self.logger: Optional[List[Dict]] = None
+        self.logging_step: Optional[int] = None
+
+        self.reset()
+
+    def reset(self, *, seed = None, options = None):
+        
+        # self._rng = random.Random(seed)
+        # Internal States
+        self._FILE_NAME = np.random.choice(self._files)
+        self._file_df = self._data_cache[self._FILE_NAME]
+        self._start_ind = INT_TYPE(0)
+        ranges = self._get_short_slice(self._file_df, self._start_ind, self._L)
+        self._market_open = ranges.open[0]
+        self._holding_period = INT_TYPE(0)
+        
+        self._pos = StockState.noTrade  # Define the initial state
+        self._unreal_cumul = FLOAT_TYPE(0.0)  # unrealized cumulative training reward
+        self._real_cumul = FLOAT_TYPE(0.0)    # realized cumulative training reward
+        self._train_reward = FLOAT_TYPE(0.0)
+        
+        """ Create the reset state """
+        # Set previous stock value and time based on last available stocks and times
+        self._market_start_time_delta = FLOAT_TYPE(ranges.time[self._L - 1])   # L-1 minutes since market start
+        self._mr_action_time_delta = FLOAT_TYPE(ranges.time[self._L - 1])      # L-1 minutes since market start
+        
+        independent_state = self._make_independent_state(ranges)
+        compound_state = self._make_compound_state(ranges)
+        
+        """ 
+        Dependent State:
+        0. MR time delta is an array of times since the market start, even though no actions have taken place.
+        1. MR direction is 0, ie no Trade which is explicity assigned. 
+        2. unrealized cumul pnl for curr trade is 0 since no trades have happened yet
+        3. realized cumul pnl for all trades is 0 since not trades have happened yet
+        """
+        self._dependent_state = np.zeros(shape=(self._L, self._D), dtype=FLOAT_TYPE)
+        self._dependent_state[:,0] = ranges.time / self._market_end_time_delta
+        self._dependent_state[:,1] = self._pos.value
+        
+        # Preparation for step function
+        self._is_episode_over = False
+        self._start_ind += INT_TYPE(1)
+
+        # Some safety checks
+        assert independent_state.shape == (self._L, self._I)
+        assert compound_state.shape == (self._C,)
+
+        return (
+            {'independent': independent_state, 'dependent': self._dependent_state, 'compound': compound_state},
+            {"eval_reward": FLOAT_TYPE(0)}
+        )
+
+    def step(self, action):
+
+        if self._is_episode_over : return self.reset()
+        pos_new = self._action_map[INT_TYPE(action)]
+        ranges = self._get_short_slice(self._file_df, self._start_ind, self._L)
+        
+        """ Update metrics based on new data """
+        # calculate new start time delta and prev time delta
+        # the difference between previous start prediction time delta and current latest time is an interval, so add that 
+        self._mr_action_time_delta += ranges.time[-1] - self._market_start_time_delta
+        self._market_start_time_delta = ranges.time[-1]
+
+        new_stock_price = ranges.close[-1] # new representative stock price
+        new_reward = np.log(new_stock_price) - np.log(ranges.open[-1]) # stock change,
+        
+        # create independent simple and compound states
+        independent_state = self._make_independent_state(ranges)
+        compound_state = self._make_compound_state(ranges)
+        
+        """ Predefine some states """
+        train_raw = FLOAT_TYPE(0.0)
+        eval_reward = FLOAT_TYPE(0.0)
+        
+        """ EOD handling """
+        if self._market_start_time_delta >= self._market_end_time_delta:
+            # EOD does not take agent action into account for penalization
+            
+            if self._pos != StockState.noTrade:  # currently holding, so force a closure
+                eval_reward = new_stock_price * (self._pos.value - self._one_side_fee) # evaluation reward
+                
+                self._real_cumul += self._unreal_cumul + self._log_one_side_fee
+                state_unreal_cumul = self._log_one_side_fee
+                self._train_reward = self._log_one_side_fee # normal case reward, just the fee
+                self._mr_action_time_delta = FLOAT_TYPE(0.0)
+                
+            else: #then no fees, use previous time delta, 
+                state_unreal_cumul = FLOAT_TYPE(0.0)
+            
+            # Force the agent to close the trade
+            pos_new = StockState.noTrade
+            
+            self._dependent_state = self._make_dependent_state(self._dependent_state, self._mr_action_time_delta, pos_new, state_unreal_cumul, self._real_cumul)
+            
+            # log states before reward scaling
+            if self.logger is not None and self.logging_step is not None:
+                self.logger.append({
+                    'step':  self.logging_step,
+                    'raw':   train_raw,
+                    'reward': self._train_reward,
+                    'eval_reward':eval_reward,
+                    'action': pos_new.name,
+                    'prev_action': self._pos.name,
+                    'data': new_stock_price,
+                })
+            # prepare for reset
+            self._is_episode_over = True 
+            return ({'independent': independent_state,
+                 'dependent': self._dependent_state,
+                 'compound':compound_state},                    #observation
+                float(self._train_reward * self._reward_sf),    # training reward
+                self._is_episode_over,                          # termination
+                False,                                           # truncation (Not used in this MDP formulation)
+                {"eval_reward": eval_reward * self._reward_sf})   # info dict with evaluation
+
+        """ Reward Calculation """
+        # precompute change in position
+        delta_pos = self._pos.value - pos_new.value
+        
+        # literal money reward
+        eval_reward = new_stock_price * ( delta_pos - abs(delta_pos) * self._one_side_fee ) # stock price - fees
+        
+        # cumulative-EMA reward
+        train_raw = pos_new.value * new_reward
+        train_fees = abs(delta_pos) * self._log_one_side_fee
+        
+        if pos_new != self._pos:
+            self._real_cumul += self._unreal_cumul + train_fees
+            self._unreal_cumul = FLOAT_TYPE(0.0)
+            self._holding_period = INT_TYPE(0)
+            self._mr_action_time_delta = FLOAT_TYPE(0.0)
+        
+        self._unreal_cumul += train_raw
+        
+        if pos_new != StockState.noTrade: self._holding_period += 1
+        
+        if self._holding_period > self._Holding_Threshold:
+            alpha = FLOAT_TYPE(0.2)
+            self._train_reward = (FLOAT_TYPE(1.0) - alpha) * self._train_reward + alpha * train_raw
+        else:
+            self._train_reward = self._unreal_cumul / FLOAT_TYPE(self._Holding_Threshold)
+        
+        state_unreal_cumul = self._unreal_cumul + train_fees # for dependent state calculation
+        self._train_reward += train_fees
+        
+        # inactive penalty computation
+        inactive_penalty = FLOAT_TYPE(0.0)
+        if self._pos == pos_new and pos_new == StockState.noTrade: # holding on noTrade
+            x = min(self._mr_action_time_delta/self._max_inactive_time, FLOAT_TYPE(1)) # cap x at 1
+            inactive_penalty = -((FLOAT_TYPE(2.0) ** x - FLOAT_TYPE(1.0)) ** self._inactive_k) * np.abs(new_reward)
+                
+        # combining all rewards        
+        self._train_reward +=  self._inactive_wf * inactive_penalty
+    
+        # get the new dependent state
+        self._dependent_state = self._make_dependent_state(self._dependent_state, self._mr_action_time_delta, pos_new, state_unreal_cumul, self._real_cumul)
+        
+        # log states before reward scaling
+        if self.logger is not None and self.logging_step is not None:
+            self.logger.append({
+                'step':  self.logging_step, 
+                'raw':   train_raw,
+                'reward': self._train_reward,
+                'eval_reward':eval_reward,
+                'action': pos_new.name,
+                'prev_action': self._pos.name,
+                'data': new_stock_price,
+            })
+        
+        # update current position for next iteration
+        self._pos = pos_new
+        self._start_ind += INT_TYPE(1)
+        return ({'independent': independent_state, 
+            'dependent': self._dependent_state, 
+            'compound':compound_state},                     # observation
+            float(self._train_reward * self._reward_sf),           # training reward
+            self._is_episode_over,                          # terminated
+            False,                                           # Truncated, (not used in this MDP formulation)
+            {"eval_reward": eval_reward * self._reward_sf})   # info dict with evaluation reward
+
+    def _make_independent_state(self,data_slice: DataSlice):
+        """
+        Construct a single state for L timestep. Assumes that the data_slice has L window ohlcv data
+
+        independent (agent-independent states) :
+            Close normalized: log(close/market_open)
+            Intra Bar Volatility Proxy: log(high/low)
+            Dlogprice: log(close/open) for the current time step
+            Time Completion Ratio: Time since market start / total market time
+            DlogVolume: log(volume/historical_median_volume) for the current time step
+            Close to Mid ratio: 2*(close - (high + low)/2)/(high - low) for the current time step,  
+                If high = low, then this number is 0
+        """
+        # Close Norm
+        close_normalized = (np.log(data_slice.close) - np.log(self._market_open)) * self._ohlc_sf  
+        
+        # Intra Bar vol
+        intra_bar_vol_proxy = (np.log(data_slice.high) - np.log(data_slice.low) ) * self._intra_bar_vol_porxy_sf
+        
+        # DLogPrice
+        dlogprice = (np.log(data_slice.close) - np.log(data_slice.open) ) * self._dlogprice_sf
+        
+        # Time Completion Ratios
+        time_completion_ratios = data_slice.time/ self._market_end_time_delta
+        
+        # DlogVolume
+        dlogvolume = np.log(data_slice.volume) # volume is already volume / historical average volume
+        
+        # Close to Mid Ratio
+        num = 2*(data_slice.close - (data_slice.high + data_slice.low)/2)
+        den = data_slice.high - data_slice.low
+        ratio = np.zeros_like(num, dtype=FLOAT_TYPE)
+        close_to_mid_ratios = np.divide(num, den, out=ratio, where=(den != 0))
+        
+        return np.stack([
+            close_normalized,
+            intra_bar_vol_proxy,
+            dlogprice,
+            time_completion_ratios,
+            dlogvolume,
+            close_to_mid_ratios,
+            ],
+            axis = -1, # stack along the feature axis, not the lookback axis
+            dtype = FLOAT_TYPE
+        )
+    
+    def _make_dependent_state(self, prev_dependent_state: np.ndarray, mr_time_delta: float, mr_dir: StockState, unreal_cumul:float, real_cumul:float):
+        """
+        Slide and update the agent-dependent state window.
+
+        The dependent-state window has shape (L, D) with columns:
+            0: most-recent-action-time-ratio (time since most recent action / total market time)
+            1: most-recent-direction (−1, 0, +1)
+            2: Unrealized Cumulative Reward (float; computed in step function)
+            3: Realized Cumulative Reward (float)
+            
+        Notes:
+        - This implementation updates `prev_dependent_state` in-place (returns the same array).
+        - Expects `prev_dependent_state` to have at least 3 columns and L rows.
+        - `mr_time_delta` is divided by the environment session length (self._market_end_time_delta).
+        """
+        
+        assert prev_dependent_state.shape == (self._L, self._D)
+        new_states = prev_dependent_state
+
+        new_states[0:self._L - 1, :] = new_states[1:self._L, :]
+
+        new_states[-1, 0] = FLOAT_TYPE(mr_time_delta * self._mr_action_time_delta_sf)
+        new_states[-1, 1] = FLOAT_TYPE(mr_dir.value)
+        new_states[-1, 2] = FLOAT_TYPE(unreal_cumul * self._cumul_pnl_sf)
+        new_states[-1, 3] = FLOAT_TYPE(real_cumul * self._cumul_pnl_sf)
+
+
+        return new_states
+
+    def _make_compound_state(self, data_slice: DataSlice):
+        """
+        Compute compound (window-level) features from an L-length DataSlice.
+
+        Returns a 1-D float32 array of length 6 with the following entries:
+        price_trend                 = sum(dlogprice) / sum(|dlogprice|)
+        unscaled_price_momemtum     = sum(|dlogprice|)
+        volume_trend                = sum(dlogvolume) / sum(|dlogvolume|)
+        skew                        = sample skewness of dlogprice (bias=False)
+        kurtosis                    = sample Fischer kurtosis of dlogprice (normal=3, bias=False)
+        max_log_dd                  = maximum log drawdown over the window: max_{i<=j} log(high_i/low_j)
+
+        All logs are computed with a small epsilon to avoid -inf/nan. Returns dtype FLOAT_TYPE.
+        """
+        dlogprice = (np.log(data_slice.close) - np.log(data_slice.open) ) * self._dlogprice_sf
+        dlogvolume = np.log(data_slice.volume)
+        
+        # Price Trend
+        price_trend = np.sum(dlogprice)/np.sum(np.absolute(dlogprice))
+        
+        # Unscaled momemtum
+        unscaled_price_momemtum = np.sum(np.absolute(dlogprice))
+        
+        # Volume Trend
+        volume_trend = np.sum(dlogvolume)/np.sum(np.absolute(dlogvolume))
+        
+        # skew (sample skew)
+        skew = scipy_stats.skew(dlogprice, bias=False, nan_policy="raise") * self._skew_sf # sample skew
+        
+        # kurtosis (sample Fischer Kurtosis)
+        kurtosis = scipy_stats.kurtosis(dlogprice, fisher=True, bias=False, nan_policy="raise")  * self._kurtotsis_sf # fisher kurtosis
+
+        # max drawdown
+        log_high = np.log(data_slice.high) 
+        log_low = np.log(data_slice.low) 
+        cumulative_max = np.maximum.accumulate(log_high) 
+        drawdowns = cumulative_max - log_low 
+        max_dd = np.max(drawdowns) * self._max_dd_sf
+        
+        return np.array([
+            price_trend,
+            unscaled_price_momemtum,
+            volume_trend,
+            skew,
+            kurtosis,
+            max_dd
+            ], dtype=FLOAT_TYPE)
+    
+    def _get_short_slice(self,file_data: DataSlice, start_ind:int, length_slices:int):
+        """
+        Extract a contiguous window from a full‐length DataSlice.
+
+        Args:
+            file_data:       A DataSlice whose fields are full‐length NumPy arrays.
+            start_ind:       The index at which to begin the slice.
+            length_slices:   The number of consecutive entries to include.
+
+        Returns:
+            A new DataSlice containing views of each field
+            from file_data[start_ind : start_ind + length_slices].
+        """
+        return DataSlice(
+            time = file_data.time[start_ind: start_ind + length_slices],
+            close = file_data.close[start_ind: start_ind + length_slices],
+            open = file_data.open[start_ind: start_ind + length_slices],
+            high = file_data.high[start_ind: start_ind + length_slices],
+            low = file_data.low[start_ind: start_ind + length_slices],
+            volume = file_data.volume[start_ind: start_ind + length_slices],
+        )
+
+    def update_data_cache(self,new_cache: Dict, new_files:List):
+        self._data_cache = new_cache
+        self._files = new_files
+
+
+
+class USStockEnvFragmented(gym.Env):
+    
+    def __init__(self, data_cache: Dict[str, DataSlice], reward_scale_factor: float = 1, look_back_period=10):
+        """
+        Initialize the trading environment.
+
+        Args:
+            data_cache (Dict[str, DataSlice]):
+                Mapping from file path (relative to dataset root) to a DataSlice object containing
+                OHLCV data and time deltas (in minutes) for each bar/candle.
+
+            reward_scale_factor (float, default=1):
+                Scalar applied to the natural log-return reward. Chosen such that the mean absolute
+                reward magnitude across the dataset is approximately 1 for stable training.
+
+            look_back_period (int, default=10):
+                Number of past time steps to include in the sliding observation window when 
+                constructing each environment state.
+        """
+
+        # Agent simple features (independent and dependent) and compound features
+        self._L = INT_TYPE(look_back_period)
+        self._I = INT_TYPE(6)           # agent independent features
+        self._D = INT_TYPE(4)           # agent dependent features
+        self._C = INT_TYPE(6)           # compound features
+        self._Aq = INT_TYPE(4)          # Action quantization level, chose so that 100/Aq is an int (1,2,4,5,8)
+        self.alpha = FLOAT_TYPE(1)
+
+        # Agent action spec from 0->2 and internal map for conversion
+        self.action_space = gym.spaces.Int16Discrete(n=2*self._Aq + 1, start=0)
+
+        # converts network's action to an environment action
+        self.action_map = lambda x: FLOAT_TYPE(x/self._Aq - 1)
+        self.action_name = lambda x: "noTrade" if x == FLOAT_TYPE(0.0) else ( "long" if x > 0 else "short")
+
+        self.observation_space = gym.spaces.Dict(
+            spaces={
+                'independent': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._L, self._I),
+                    dtype=FLOAT_TYPE
+                ),
+                'dependent': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._L, self._D),
+                    dtype=FLOAT_TYPE
+                ),
+                'compound': gym.spaces.Box(
+                    low=FLOAT_TYPE(-np.inf),
+                    high=FLOAT_TYPE(np.inf),
+                    shape=(self._C,),
+                    dtype=FLOAT_TYPE
+                ),
+            }
+        )
+
+        # Some Variables
+        self._market_end_td = FLOAT_TYPE(389.0)
+        self._data_cache = data_cache
+        self._files = list(self._data_cache.keys())
+        self._FILE_NAME = None  # current file for logging purposes
+        self._Holding_Threshold = INT_TYPE(1)
+
+        """ Scale Factors """
+        self._reward_sf = FLOAT_TYPE(reward_scale_factor)
+
+        # Compound states scale factor
+        self._skew_sf = FLOAT_TYPE(1 / 1.5)  # 1/resolution
+        self._kurtosis_sf = FLOAT_TYPE(1 / 5)
+        self._max_dd_sf = self._reward_sf / FLOAT_TYPE(4)  # eyeball estimate
+        self._volatility_sf = self._reward_sf
+
+        # Dependent states scale factor
+        self._cumul_pnl_sf = self._reward_sf / FLOAT_TYPE(10)
+        self._mr_action_time_delta_sf = FLOAT_TYPE(1) / self._market_end_td
+
+        # Independent states scale factors
+        self._true_range_sf = FLOAT_TYPE(500)
+        self._intra_bar_vol_porxy_sf = self._reward_sf
+        self._dlogprice_sf = self._reward_sf
+        self._ohlc_sf = self._reward_sf / FLOAT_TYPE(10)
+
+        # Hindsight bonus weighting factor
+        self._hindsight_wf = FLOAT_TYPE(1)
+
+        """ Fees """
+        self._one_side_fee = FLOAT_TYPE(0.0003)
+        self._log_one_side_fee = FLOAT_TYPE(np.log(1 - self._one_side_fee))
+
+        """ Predefined Rewards """
+        self._inactive_wf = FLOAT_TYPE(0.0)
+        self._inactive_k = FLOAT_TYPE(2)
+        self._max_inactive_time = FLOAT_TYPE(25)
+
+        """ Logging purposes """
+        self.logger: Optional[List[Dict]] = None
+        self.logging_step: Optional[int] = None
+
+        self.reset()
+
+    def reset(self, *, seed = None, options = None):
+        
+        # self._rng = random.Random(seed)
+        # Internal States
+        self._FILE_NAME = np.random.choice(self._files)
+        self._file_df = self._data_cache[self._FILE_NAME]
+        self._start_ind = INT_TYPE(0)
+        ranges = self._get_short_slice(self._file_df, self._start_ind, self._L)
+        self._market_open = ranges.open[0]
+        self._holding_period = INT_TYPE(1)      # at the very least
+        
+        self._pos = FLOAT_TYPE(0)                           # Define the initial state, 0 means noTrade
+        self._unreal_cumul = FLOAT_TYPE(0.0)  # unrealized cumulative training reward
+        self._real_cumul = FLOAT_TYPE(0.0)    # realized cumulative training reward
+        self._train_reward = FLOAT_TYPE(0.0)
+        
+        """ Create the reset state """
+        # Set previous stock value and time based on last available stocks and times
+        self._market_start_time_delta = FLOAT_TYPE(ranges.time[self._L - 1])   # L-1 minutes since market start
+        self._mr_action_td = FLOAT_TYPE(ranges.time[self._L - 1])      # L-1 minutes since market start
+        
+        independent_state = self._make_independent_state(ranges)
+        compound_state = self._make_compound_state(ranges)
+        
+        """ 
+        Dependent State:
+        0. MR time delta is an array of times since the market start, even though no actions have taken place.
+        1. MR direction is 0, ie no Trade which is explicity assigned. 
+        2. unrealized cumul pnl for curr trade is 0 since no trades have happened yet
+        3. realized cumul pnl for all trades is 0 since not trades have happened yet
+        """
+        self._dependent_state = np.zeros(shape=(self._L, self._D), dtype=FLOAT_TYPE)
+        self._dependent_state[:,0] = ranges.time / self._market_end_td
+        self._dependent_state[:,1] = self._pos
+        
+        # Preparation for step function
+        self._is_episode_over = False
+        self._start_ind += INT_TYPE(1)
+
+        # Some safety checks
+        assert independent_state.shape == (self._L, self._I)
+        assert compound_state.shape == (self._C,)
+
+        return (
+            {'independent': independent_state, 'dependent': self._dependent_state, 'compound': compound_state},
+            {"eval_reward": FLOAT_TYPE(0)}
+        )
+
+    def step(self, action):
+
+        if self._is_episode_over : return self.reset()
+        pos_new = self.action_map(action)
+        ranges = self._get_short_slice(self._file_df, self._start_ind, self._L)
+        
+        """ Update metrics based on new data """
+        # calculate new start time delta and prev time delta
+        # the difference between previous start prediction time delta and current latest time is an interval, so add that 
+        self._mr_action_td += ranges.time[-1] - self._market_start_time_delta
+        self._market_start_time_delta = ranges.time[-1]
+
+        new_stock_price = ranges.close[-1] # new representative stock price
+        new_reward = np.log(new_stock_price) - np.log(ranges.open[-1]) # stock change,
+        
+        # create independent simple and compound states
+        independent_state = self._make_independent_state(ranges)
+        compound_state = self._make_compound_state(ranges)
+        
+        """ Predefine some states """
+        train_raw = FLOAT_TYPE(0.0)
+        eval_reward = FLOAT_TYPE(0.0)
+        
+        """ EOD handling """
+        if self._market_start_time_delta >= self._market_end_td:
+            # EOD does not take agent action into account for penalization
+            
+            if self._pos != FLOAT_TYPE(0.0):  # currently holding, so force a closure
+                eval_reward = new_stock_price * (self._pos - self._one_side_fee) # evaluation reward
+                
+                self._real_cumul += self._unreal_cumul + self._log_one_side_fee
+                state_unreal_cumul = self._log_one_side_fee
+                self._train_reward = self._log_one_side_fee # normal case reward, just the fee
+                self._mr_action_td = FLOAT_TYPE(0.0)
+                
+            else: #then no fees, use previous time delta, 
+                state_unreal_cumul = FLOAT_TYPE(0.0)
+            
+            # Force the agent to close the trade
+            pos_new = FLOAT_TYPE(0)
+            
+            self._dependent_state = self._make_dependent_state(self._dependent_state, self._mr_action_td, pos_new, state_unreal_cumul, self._real_cumul)
+            
+            # log states before reward scaling
+            if self.logger is not None and self.logging_step is not None:
+                self.logger.append({
+                    'step':  self.logging_step,
+                    'raw':   train_raw,
+                    'reward': self._train_reward,
+                    'eval_reward':eval_reward,
+                    'action': self.action_name(pos_new),
+                    'prev_action': self.action_name(self._pos),
+                    'data': new_stock_price,
+                })
+            # prepare for reset
+            self._is_episode_over = True 
+            return ({'independent': independent_state,
+                 'dependent': self._dependent_state,
+                 'compound':compound_state},                    #observation
+                float(self._train_reward * self._reward_sf),    # training reward
+                self._is_episode_over,                          # termination
+                False,                                           # truncation (Not used in this MDP formulation)
+                {"eval_reward": eval_reward})   # info dict with evaluation
+
+        """ Reward Calculation """
+        # precompute change in position
+        delta_pos = self._pos - pos_new
+        
+        # literal money reward
+        eval_reward = new_stock_price * ( delta_pos - abs(delta_pos) * self._one_side_fee ) # stock price - fees
+        
+        # cumulative-EMA reward
+        train_raw = pos_new * new_reward
+        train_fees = abs(delta_pos) * self._log_one_side_fee
+        
+        if np.sign(pos_new) != np.sign(self._pos):    # if position changed
+            # realize the profit from unrealized
+            self._real_cumul += self._unreal_cumul + train_fees
+            #reset unrealized cumul, holding period and MR action timedelta
+            self._unreal_cumul = FLOAT_TYPE(0.0)
+            self._holding_period = INT_TYPE(1)
+            self._mr_action_td = FLOAT_TYPE(0.0)
+        
+        self._unreal_cumul += train_raw
+        
+        if self._holding_period > self._Holding_Threshold:
+            self._train_reward = (FLOAT_TYPE(1.0) - self.alpha) * self._train_reward + self.alpha * train_raw
+        else:
+            self._train_reward = self._unreal_cumul / FLOAT_TYPE(self._holding_period)
+        state_unreal_cumul = self._unreal_cumul + train_fees # for dependent state calculation, keep unreal_cumul free of fees
+        self._train_reward += train_fees                     # train reward is unreal _ cumul
+        
+        # inactive penalty computation
+        inactive_penalty = FLOAT_TYPE(0.0)
+        if self._pos == pos_new and pos_new == FLOAT_TYPE(0): # holding on noTrade
+            x = min(self._mr_action_td/self._max_inactive_time, FLOAT_TYPE(1)) # cap x at 1
+            inactive_penalty = -((FLOAT_TYPE(2.0) ** x - FLOAT_TYPE(1.0)) ** self._inactive_k) * np.abs(new_reward)
+                
+        # combining all rewards        
+        self._train_reward +=  self._inactive_wf * inactive_penalty
+    
+        # get the new dependent state
+        self._dependent_state = self._make_dependent_state(self._dependent_state, self._mr_action_td, pos_new, state_unreal_cumul, self._real_cumul)
+        
+        # log states before reward scaling
+        if self.logger is not None and self.logging_step is not None:
+            self.logger.append({
+                'step':  self.logging_step, 
+                'raw':   train_raw,
+                'reward': self._train_reward,
+                'eval_reward':eval_reward,
+                'action': self.action_name(pos_new),
+                'prev_action': self.action_name(self._pos),
+                'data': new_stock_price,
+            })
+        
+        # updates for next iteration
+        if pos_new != FLOAT_TYPE(0): self._holding_period += INT_TYPE(1)    # update only in case of active hold, reset already accounted for
+        self._pos = pos_new
+        self._start_ind += INT_TYPE(1)
+        return ({'independent': independent_state, 
+            'dependent': self._dependent_state, 
+            'compound':compound_state},                     # observation
+            float(self._train_reward * self._reward_sf),           # training reward
+            self._is_episode_over,                          # terminated
+            False,                                           # Truncated, (not used in this MDP formulation)
+            {"eval_reward": eval_reward})   # info dict with evaluation reward
+
+    def _make_independent_state(self,data_slice: DataSlice):
+        """
+        Construct a single state for L timestep. Assumes that the data_slice has L window ohlcv data
+
+        independent (agent-independent states) :
+            Close normalized: log(close/market_open)
+            Intra Bar Volatility Proxy: log(high/low)
+            Dlogprice: log(close/open) for the current time step
+            Time Completion Ratio: Time since market start / total market time
+            DlogVolume: log(volume/historical_median_volume) for the current time step
+            Close to Mid ratio: 2*(close - (high + low)/2)/(high - low) for the current time step,  
+                If high = low, then this number is 0
+        """
+        # Close Norm
+        close_normalized = (np.log(data_slice.close) - np.log(self._market_open)) * self._ohlc_sf  
+        
+        # Intra Bar vol
+        intra_bar_vol_proxy = (np.log(data_slice.high) - np.log(data_slice.low) ) * self._intra_bar_vol_porxy_sf
+        
+        # DLogPrice
+        dlogprice = (np.log(data_slice.close) - np.log(data_slice.open) ) * self._dlogprice_sf
+        
+        # Time Completion Ratios
+        time_completion_ratios = data_slice.time/ self._market_end_td
+        
+        # DlogVolume
+        dlogvolume = np.log(data_slice.volume) # volume is already volume / historical average volume
+        
+        # Close to Mid Ratio
+        num = 2*(data_slice.close - (data_slice.high + data_slice.low)/2)
+        den = data_slice.high - data_slice.low
+        ratio = np.zeros_like(num, dtype=FLOAT_TYPE)
+        close_to_mid_ratios = np.divide(num, den, out=ratio, where=(den != 0))
+        
+        return np.stack([
+            close_normalized,
+            intra_bar_vol_proxy,
+            dlogprice,
+            time_completion_ratios,
+            dlogvolume,
+            close_to_mid_ratios,
+            ],
+            axis = -1, # stack along the feature axis, not the lookback axis
+            dtype = FLOAT_TYPE
+        )
+    
+    def _make_dependent_state(self, prev_dependent_state: np.ndarray, mr_action_td: float, mr_dir: float, unreal_cumul:float, real_cumul:float):
+        """
+        Slide and update the agent-dependent state window.
+
+        The dependent-state window has shape (L, D) with columns:
+            0: most-recent-action-time-ratio (time since most recent action / total market time)
+            1: most-recent-direction
+            2: Unrealized Cumulative Reward (float; computed in step function)
+            3: Realized Cumulative Reward (float)
+            
+        Notes:
+        - This implementation updates `prev_dependent_state` in-place (returns the same array).
+        - Expects `prev_dependent_state` to have at least 3 columns and L rows.
+        - `mr_time_delta` is divided by the environment session length (self._market_end_time_delta).
+        """
+        
+        assert prev_dependent_state.shape == (self._L, self._D)
+        new_states = prev_dependent_state
+
+        new_states[0:self._L - 1, :] = new_states[1:self._L, :]
+
+        new_states[-1, 0] = FLOAT_TYPE(mr_action_td / self._market_end_td * self._mr_action_time_delta_sf)
+        new_states[-1, 1] = FLOAT_TYPE(mr_dir)
+        new_states[-1, 2] = FLOAT_TYPE(unreal_cumul * self._cumul_pnl_sf)
+        new_states[-1, 3] = FLOAT_TYPE(real_cumul * self._cumul_pnl_sf)
+
+
+        return new_states
+
+    def _make_compound_state(self, data_slice: DataSlice):
+        """
+        Compute compound (window-level) features from an L-length DataSlice.
+
+        Returns a 1-D float32 array of length 6 with the following entries:
+        price_trend                 = sum(dlogprice) / sum(|dlogprice|)
+        unscaled_price_momemtum     = sum(|dlogprice|)
+        volume_trend                = sum(dlogvolume) / sum(|dlogvolume|)
+        skew                        = sample skewness of dlogprice (bias=False)
+        kurtosis                    = sample Fischer kurtosis of dlogprice (normal=3, bias=False)
+        max_log_dd                  = maximum log drawdown over the window: max_{i<=j} log(high_i/low_j)
+
+        All logs are computed with a small epsilon to avoid -inf/nan. Returns dtype FLOAT_TYPE.
+        """
+        dlogprice = (np.log(data_slice.close) - np.log(data_slice.open) ) * self._dlogprice_sf
+        dlogvolume = np.log(data_slice.volume)
+        
+        # Price Trend
+        price_trend = np.sum(dlogprice)/np.sum(np.absolute(dlogprice))
+        
+        # Unscaled momemtum
+        unscaled_price_momemtum = np.sum(np.absolute(dlogprice))
+        
+        # Volume Trend
+        volume_trend = np.sum(dlogvolume)/np.sum(np.absolute(dlogvolume))
+        
+        # skew (sample skew)
+        skew = scipy_stats.skew(dlogprice, bias=False, nan_policy="raise") * self._skew_sf # sample skew
+        
+        # kurtosis (sample Fischer Kurtosis)
+        kurtosis = scipy_stats.kurtosis(dlogprice, fisher=True, bias=False, nan_policy="raise")  * self._kurtosis_sf # fisher kurtosis
+
+        # max drawdown
+        log_high = np.log(data_slice.high) 
+        log_low = np.log(data_slice.low) 
+        cumulative_max = np.maximum.accumulate(log_high) 
+        drawdowns = cumulative_max - log_low 
+        max_dd = np.max(drawdowns) * self._max_dd_sf
+        
+        return np.array([
+            price_trend,
+            unscaled_price_momemtum,
+            volume_trend,
+            skew,
+            kurtosis,
+            max_dd
+            ], dtype=FLOAT_TYPE)
+    
+    def _get_short_slice(self,file_data: DataSlice, start_ind:int, length_slices:int):
+        """
+        Extract a contiguous window from a full‐length DataSlice.
+
+        Args:
+            file_data:       A DataSlice whose fields are full‐length NumPy arrays.
+            start_ind:       The index at which to begin the slice.
+            length_slices:   The number of consecutive entries to include.
+
+        Returns:
+            A new DataSlice containing views of each field
+            from file_data[start_ind : start_ind + length_slices].
+        """
+        return DataSlice(
+            time = file_data.time[start_ind: start_ind + length_slices],
+            close = file_data.close[start_ind: start_ind + length_slices],
+            open = file_data.open[start_ind: start_ind + length_slices],
+            high = file_data.high[start_ind: start_ind + length_slices],
+            low = file_data.low[start_ind: start_ind + length_slices],
+            volume = file_data.volume[start_ind: start_ind + length_slices],
+        )
+
+    def update_data_cache(self,new_cache: Dict, new_files:List):
+        self._data_cache = new_cache
+        self._files = new_files
+         
+        

@@ -589,7 +589,7 @@ class SumTree:
         return _get_range_sum_int(l, r, 0, self._capacity- 1, 0)
 
 # Replacement Policies
-def stochastic_priority_replacement(sum_tree: SumTree, input_tuple_list: Tuple[Any, float]):
+def stochastic_priority_replacement(sum_tree: SumTree, input_tuple_list: List[Tuple[Any, float]]):
     """
     Replaces input_tuples at random, weighted by the inverse augmented priority (P_i)**alpha.
     That is, a higher priority index has less of a chance of being kicked out.

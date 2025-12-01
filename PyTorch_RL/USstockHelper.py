@@ -11,11 +11,11 @@ import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from pathlib import Path
 import numpy as np
+from zoneinfo import ZoneInfo
 
 
 DATA_DIR = "../US_Market_Data"
 interval="1m"
-utc_to_ny = timedelta(hours=-4)
 date_format = "%Y-%m-%d"
 date_file = "date_file.txt"
 
@@ -107,7 +107,7 @@ def create_previous_data_file(tickers, date_str):
     - tickers (list of str): List of stock ticker symbols.
     - date_str (str): Date string in 'YYYY-MM-DD' format for which to download data.
     """
-    global interval, utc_to_ny, date_format
+    global interval, date_format
     
     # Parse input date string
     date_obj = datetime.strptime(date_str, date_format)
@@ -133,7 +133,17 @@ def create_previous_data_file(tickers, date_str):
         local_df.loc[:,"Volume"] = local_df.loc[:,"Volume"].round()
 
         # Format index to only keep hour and minute (e.g., '13:45') in ny time zone
-        local_df.index += utc_to_ny
+        idx = local_df.index
+
+        # If index has no timezone, localize to UTC
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+
+        # Convert to NY time (DST aware)
+        idx = idx.tz_convert("America/New_York")
+        local_df.index = idx
+        local_df = local_df.between_time("09:30", "16:00", inclusive= "left")
+        # Format final HH:MM
         local_df.index = local_df.index.strftime('%H:%M')
 
         # Round all price columns to 2 decimal places
